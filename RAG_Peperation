@@ -1,0 +1,184 @@
+import os
+import json
+import openai
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
+
+# Define your OpenAI API key
+openai.api_key = 'your_openai_api_key'
+
+# Define the relative directories
+relative_directories = [
+    r"Engine\Plugins\Runtime\MassEntity",
+    r"Engine\Plugins\Runtime\MassGameplay"
+]
+
+# Base directory
+base_directory = r"D:\UnrealEngine\UE_5.4"
+
+# Define token limit and chunk size
+TOKEN_LIMIT = 2048
+CHUNK_SIZE = 500
+
+# Function to get line-by-line explanations using GPT-4
+def get_line_explanations(lines):
+    explanations = []
+    for line in lines:
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that explains code line by line."},
+                    {"role": "user", "content": f"Explain this line of code: {line}"}
+                ]
+            )
+            explanation = response['choices'][0]['message']['content'].strip()
+            explanations.append({"line": line, "explanation": explanation})
+        except Exception as e:
+            explanations.append({"line": line, "explanation": "Error generating explanation: " + str(e)})
+    return explanations
+
+# Function to get functionality description using GPT-4
+def get_functionality_description(content):
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that describes the functionality of code files."},
+                {"role": "user", "content": f"Describe the functionality of this code:\n\n{content}"}
+            ]
+        )
+        description = response['choices'][0]['message']['content'].strip()
+        return description
+    except Exception as e:
+        return "Error generating functionality description: " + str(e)
+
+# Function to get Q&A pairs using GPT-4
+def get_qa_pairs(content, plugin):
+    qa_pairs = []
+    questions = [
+        "What does this header file define?",
+        "What is the main function implemented in this file?",
+        "What are the dependencies of this file?"
+    ]
+    for question in questions:
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that answers questions about code files."},
+                    {"role": "user", "content": f"{question}:\n\n{content}"}
+                ]
+            )
+            answer = response['choices'][0]['message']['content'].strip()
+            qa_pairs.append({
+                "question": question,
+                "answer": answer
+            })
+        except Exception as e:
+            qa_pairs.append({
+                "question": question,
+                "answer": "Error generating answer: " + str(e)
+            })
+    return qa_pairs
+
+# Function to chunk large content
+def chunk_content(content):
+    lines = content.splitlines()
+    return [lines[i:i + CHUNK_SIZE] for i in range(0, len(lines), CHUNK_SIZE)]
+
+# Function to process each file
+def process_file(file_path, relative_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            
+            # Extract dependencies from #include statements
+            dependencies = [line.strip() for line in content.splitlines() if line.strip().startswith('#include')]
+            
+            # Generate a functionality description using GPT-4
+            functionality = get_functionality_description(content)
+            
+            # Generate line-by-line explanations using GPT-4
+            if len(content) > TOKEN_LIMIT:
+                chunks = chunk_content(content)
+                line_explanations = []
+                for chunk in chunks:
+                    line_explanations.extend(get_line_explanations(chunk))
+            else:
+                lines = content.splitlines()
+                line_explanations = get_line_explanations(lines)
+
+            # Generate Q&A pairs using GPT-4
+            qa_pairs = get_qa_pairs(content, os.path.basename(os.path.dirname(relative_path)))
+
+            return {
+                'file_name': os.path.basename(file_path),
+                'file_path': relative_path,
+                'content': content,
+                'metadata': {
+                    'project': 'Unreal Engine',
+                    'plugin': os.path.basename(os.path.dirname(relative_path)),
+                    'dependencies': dependencies,
+                    'functionality': functionality
+                },
+                'line_explanations': line_explanations,
+                'qa': qa_pairs
+            }
+    except Exception as e:
+        return {
+            'file_name': os.path.basename(file_path),
+            'file_path': relative_path,
+            'error': str(e)
+        }
+
+# Function to parse and process the files
+def parse_files(base_directory, relative_directories):
+    data = []
+    failed_files = []
+    
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_file = {executor.submit(process_file, os.path.join(root, file), os.path.relpath(os.path.join(root, file), base_directory)): (root, file)
+                          for relative_dir in relative_directories
+                          for root, _, files in os.walk(os.path.join(base_directory, relative_dir))
+                          for file in files if file.endswith(('.h', '.cpp'))}
+
+        for future in tqdm(future_to_file, total=len(future_to_file)):
+            try:
+                result = future.result()
+                if 'error' in result:
+                    failed_files.append(result)
+                else:
+                    data.append(result)
+            except Exception as exc:
+                root, file = future_to_file[future]
+                failed_files.append({
+                    'file_name': file,
+                    'file_path': os.path.relpath(os.path.join(root, file), base_directory),
+                    'error': str(exc)
+                })
+
+    return data, failed_files
+
+# Save the data incrementally to separate JSONL files
+def save_data_incrementally(data, base_directory):
+    for entry in data:
+        plugin = entry['metadata']['plugin']
+        output_dir = os.path.join(base_directory, 'rag_data', plugin)
+        os.makedirs(output_dir, exist_ok=True)
+        output_file = os.path.join(output_dir, f"{plugin}.jsonl")
+        with open(output_file, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
+# Get the data
+data, failed_files = parse_files(base_directory, relative_directories)
+
+# Save the successful data incrementally
+save_data_incrementally(data, base_directory)
+
+# Save the failed files to a JSON file
+with open('failed_files.json', 'w', encoding='utf-8') as f:
+    json.dump(failed_files, f, ensure_ascii=False, indent=4)
+
+print("Data has been saved incrementally to separate JSONL files.")
+print("Failed files have been logged in failed_files.json")
